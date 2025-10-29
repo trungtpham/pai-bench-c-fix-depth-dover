@@ -45,7 +45,7 @@ def overall_consistency(clip_model, video_dict, tokenizer, device, sample="middl
     video_results = []
     image_transform = clip_transform(224)
     for info in tqdm(video_dict, disable=get_rank() > 0):
-        query = info['prompt'] if isinstance(info['prompt'], str) else info['prompt']['prompt_en']
+        query = info['prompt']['prompt_en']
         # text = clip.tokenize([query]).to(device)
         video_list = info['video_list']
         for video_path in video_list:

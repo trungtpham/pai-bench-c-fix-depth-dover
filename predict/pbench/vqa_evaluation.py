@@ -81,7 +81,7 @@ class QwenVLEvaluator:
         model_kwargs = {
             "model": self.model_name,
             "trust_remote_code": True,
-            "max_model_len": 8192,
+            "max_model_len": 65536,
             "limit_mm_per_prompt": {"video": 1},
             "tensor_parallel_size": self.tensor_parallel_size,
             "gpu_memory_utilization": 0.75,
@@ -97,7 +97,7 @@ class QwenVLEvaluator:
             max_pixels=768 * 28 * 28
         )
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.tokenizer.model_max_length = 8192  # Match max_model_len
+        self.tokenizer.model_max_length = 65536  # Match max_model_len
         self.processor.tokenizer = self.tokenizer
 
         # Set up sampling parameters for consistent generation
@@ -363,6 +363,7 @@ def compute_vqa_accuracy(
     model_name="Qwen/Qwen2.5-VL-72B-Instruct",
     device="cuda",
     tensor_parallel_size=8,
+    enable_missing_videos=False,
     **kwargs
 ):
     """
@@ -392,6 +393,34 @@ def compute_vqa_accuracy(
     # Load prompt file to get video_id mapping
     prompt_data = load_json(prompt_file)
     video_id_set = {item['video_id'] for item in prompt_data}
+
+    # Check for missing videos before starting evaluation
+    if get_rank() == 0:
+        logger.info("Checking for video files...")
+        missing_videos = []
+        existing_videos = []
+
+        for video_id in video_id_set:
+            video_info_list = find_all_video_files(video_id, video_dir)
+            if not video_info_list:
+                missing_videos.append(video_id)
+            else:
+                existing_videos.append(video_id)
+
+        if missing_videos:
+            logger.warning(f"Found {len(missing_videos)} missing videos out of {len(video_id_set)} total videos")
+            if not enable_missing_videos:
+                error_msg = f"Missing videos detected. Use --enable_missing_videos to skip them.\nMissing videos: {missing_videos[:10]}"
+                if len(missing_videos) > 10:
+                    error_msg += f"\n... and {len(missing_videos) - 10} more"
+                logger.error(error_msg)
+                raise FileNotFoundError(error_msg)
+            else:
+                logger.info(f"Will skip {len(missing_videos)} missing videos during evaluation")
+        else:
+            logger.info(f"All {len(video_id_set)} videos found")
+
+    barrier()
 
     # Initialize evaluator with vLLM backend
     evaluator = QwenVLEvaluator(model_name=model_name, device=device, tensor_parallel_size=tensor_parallel_size)
@@ -468,8 +497,14 @@ def compute_vqa_accuracy(
         # Find all corresponding video files (different seeds) for this video_id
         video_info_list = find_all_video_files(video_id, video_dir)
         if not video_info_list:
-            logger.warning(f"No video files found for {video_id}")
-            continue
+            if enable_missing_videos:
+                # Skip missing videos when flag is enabled
+                continue
+            else:
+                # Error out when flag is disabled
+                error_msg = f"No video files found for {video_id}"
+                logger.error(error_msg)
+                raise FileNotFoundError(error_msg)
 
         # logger.info(f"Processing video_id: {video_id} with {len(video_info_list)} seed versions")
 

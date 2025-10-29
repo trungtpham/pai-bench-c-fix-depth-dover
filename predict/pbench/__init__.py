@@ -43,21 +43,33 @@ class PBench(object):
         return image_dict
 
 
-    def build_full_info_json(self, videos_path, name, dimension_list, prompt_list=[],  special_str='', verbose=False, custom_image_folder=None, mode='vbench_standard', **kwargs):
+    def build_full_info_json(self, videos_path, name, dimension_list, prompt_list=[],  special_str='', verbose=False, custom_image_folder=None, mode='vbench_standard', enable_missing_videos=False, **kwargs):
         cur_full_info_list=[] # to save the prompt and video path info for the current dimensions
+
+        # Track missing videos for reporting
+        missing_videos_count = 0
+
         if mode=='custom_input':
             self.check_dimension_requires_extra_info(dimension_list)
             if custom_image_folder:
                 custom_image_dict = self.build_custom_image_dict(custom_image_folder)
 
             if os.path.isfile(videos_path):
-                if custom_image_folder is None:
-                    cur_full_info_list = [{"prompt_en": get_prompt_from_filename(videos_path), "dimension": dimension_list, "video_list": [videos_path]}]
+                # Check if single video file exists
+                if not os.path.exists(videos_path):
+                    if not enable_missing_videos:
+                        raise FileNotFoundError(f"Video file not found: {videos_path}")
+                    else:
+                        print0(f"WARNING: Skipping missing video file: {videos_path}")
+                        missing_videos_count += 1
                 else:
-                    cur_full_info_list = [{"prompt_en": get_prompt_from_filename(videos_path), "dimension": dimension_list, "video_list": [videos_path], "custom_image_path": custom_image_dict[get_prompt_from_filename(videos_path)]}]
+                    if custom_image_folder is None:
+                        cur_full_info_list = [{"prompt_en": get_prompt_from_filename(videos_path), "dimension": dimension_list, "video_list": [videos_path]}]
+                    else:
+                        cur_full_info_list = [{"prompt_en": get_prompt_from_filename(videos_path), "dimension": dimension_list, "video_list": [videos_path], "custom_image_path": custom_image_dict[get_prompt_from_filename(videos_path)]}]
 
-                if len(prompt_list) == 1:
-                    cur_full_info_list[0]["prompt_en"] = prompt_list[0]
+                    if len(prompt_list) == 1:
+                        cur_full_info_list[0]["prompt_en"] = prompt_list[0]
             else:
                 video_names = os.listdir(videos_path)
 
@@ -68,37 +80,77 @@ class PBench(object):
                         postfix = Path(os.path.join(videos_path, filename)).suffix
                         if postfix.lower() not in ['.mp4', '.gif',]: #  '.jpg', '.png'
                             continue
+                        video_path = os.path.join(videos_path, filename)
+                        # Check if video exists
+                        if not os.path.exists(video_path):
+                            if not enable_missing_videos:
+                                raise FileNotFoundError(f"Video file not found: {video_path}")
+                            else:
+                                print0(f"WARNING: Skipping missing video: {video_path}")
+                                missing_videos_count += 1
+                                continue
                         cur_full_info_list.append({
                             "prompt_en": get_prompt_from_filename(filename),
                             "dimension": dimension_list,
-                            "video_list": [os.path.join(videos_path, filename)]
+                            "video_list": [video_path]
                         })
                 else:
                     for filename in video_names:
                         postfix = Path(os.path.join(videos_path, filename)).suffix
                         if postfix.lower() not in ['.mp4', '.gif']: #  '.jpg', '.png'
                             continue
+                        video_path = os.path.join(videos_path, filename)
+                        # Check if video exists
+                        if not os.path.exists(video_path):
+                            if not enable_missing_videos:
+                                raise FileNotFoundError(f"Video file not found: {video_path}")
+                            else:
+                                print0(f"WARNING: Skipping missing video: {video_path}")
+                                missing_videos_count += 1
+                                continue
+
+                        prompt_name = get_prompt_from_filename(filename)
+                        # Check if custom image exists for this prompt
+                        if prompt_name not in custom_image_dict:
+                            if not enable_missing_videos:
+                                raise FileNotFoundError(f"Custom image not found for prompt: {prompt_name}")
+                            else:
+                                print0(f"WARNING: Skipping video due to missing custom image for prompt: {prompt_name}")
+                                missing_videos_count += 1
+                                continue
+
                         cur_full_info_list.append({
-                            "prompt_en": get_prompt_from_filename(filename),
+                            "prompt_en": prompt_name,
                             "dimension": dimension_list,
-                            "video_list": [os.path.join(videos_path, filename)],
-                            "custom_image_path": custom_image_dict[get_prompt_from_filename(filename)]
+                            "video_list": [video_path],
+                            "custom_image_path": custom_image_dict[prompt_name]
                         })
 
                 if len(prompt_list) > 0:
                     prompt_list = {os.path.join(videos_path, path): prompt_list[path] for path in prompt_list}
-                    assert len(prompt_list) >= len(cur_full_info_list), """
-                        Number of prompts should match with number of videos.\n
-                        Got {len(prompt_list)=}, {len(cur_full_info_list)=}\n
-                        To read the prompt from filename, delete --prompt_file and --prompt_list
-                        """
+
+                    if not enable_missing_videos:
+                        assert len(prompt_list) >= len(cur_full_info_list), """
+                            Number of prompts should match with number of videos.\n
+                            Got {len(prompt_list)=}, {len(cur_full_info_list)=}\n
+                            To read the prompt from filename, delete --prompt_file and --prompt_list
+                            """
 
                     all_video_path = [os.path.abspath(file) for file in list(chain.from_iterable(vid["video_list"] for vid in cur_full_info_list))]
                     backslash = "\n"
-                    assert len(set(all_video_path) - set([os.path.abspath(path_key) for path_key in prompt_list])) == 0, f"""
-                    The prompts for the following videos are not found in the prompt file: \n
-                    {backslash.join(set(all_video_path) - set([os.path.abspath(path_key) for path_key in prompt_list]))}
-                    """
+                    missing_prompts = set(all_video_path) - set([os.path.abspath(path_key) for path_key in prompt_list])
+                    if missing_prompts:
+                        if not enable_missing_videos:
+                            assert len(missing_prompts) == 0, f"""
+                            The prompts for the following videos are not found in the prompt file: \n
+                            {backslash.join(missing_prompts)}
+                            """
+                        else:
+                            print0(f"WARNING: {len(missing_prompts)} videos have no prompts in prompt file, skipping them")
+                            # Filter out videos without prompts
+                            cur_full_info_list = [vid for vid in cur_full_info_list
+                                                 if os.path.abspath(vid["video_list"][0]) not in missing_prompts]
+                            missing_videos_count += len(missing_prompts)
 
                     video_map = {}
                     for prompt_key in prompt_list:
@@ -110,7 +162,14 @@ class PBench(object):
                         # If the prompt dictionary has image information, add it to the video_info
                         if isinstance(prompt_dict, dict) and "image_name" in prompt_dict:
                             if custom_image_folder:
-                                video_info["custom_image_path"] = os.path.join(custom_image_folder, prompt_dict["image_name"])
+                                image_path = os.path.join(custom_image_folder, prompt_dict["image_name"])
+                                # Check if custom image exists
+                                if not os.path.exists(image_path):
+                                    if not enable_missing_videos:
+                                        raise FileNotFoundError(f"Custom image not found: {image_path}")
+                                    else:
+                                        print0(f"WARNING: Custom image not found: {image_path}, using filename as path")
+                                video_info["custom_image_path"] = image_path
                             else:
                                 video_info["custom_image_path"] = prompt_dict["image_name"]
 
@@ -142,7 +201,16 @@ class PBench(object):
                     postfix = Path(os.path.join(videos_path, filename)).suffix
                     if postfix.lower() not in ['.mp4', '.gif', '.jpg', '.png']:
                         continue
-                    video_list.append(os.path.join(videos_path, filename))
+                    video_path = os.path.join(videos_path, filename)
+                    # Check if video exists
+                    if not os.path.exists(video_path):
+                        if not enable_missing_videos:
+                            raise FileNotFoundError(f"Video file not found: {video_path}")
+                        else:
+                            print0(f"WARNING: Skipping missing video: {video_path}")
+                            missing_videos_count += 1
+                            continue
+                    video_list.append(video_path)
 
                 cur_full_info_list.append({
                     "prompt_en": prompt,
@@ -163,21 +231,39 @@ class PBench(object):
                         intended_video_name = f'{prompt}{special_str}-{str(i)}{postfix}'
                         if intended_video_name in video_names: # if the video exists
                             intended_video_path = os.path.join(videos_path, intended_video_name)
-                            prompt_dict['video_list'].append(intended_video_path)
-                            if verbose:
-                                print0(f'Successfully found video: {intended_video_name}')
+                            # Check if video file actually exists
+                            if os.path.exists(intended_video_path):
+                                prompt_dict['video_list'].append(intended_video_path)
+                                if verbose:
+                                    print0(f'Successfully found video: {intended_video_name}')
+                            else:
+                                if not enable_missing_videos:
+                                    raise FileNotFoundError(f'Video file not found: {intended_video_path}')
+                                else:
+                                    print0(f'WARNING!!! Skipping missing video: {intended_video_name}')
+                                    missing_videos_count += 1
                         else:
-                            print0(f'WARNING!!! This required video is not found! Missing benchmark videos can lead to unfair evaluation result. The missing video is: {intended_video_name}')
-                    cur_full_info_list.append(prompt_dict)
+                            if not enable_missing_videos:
+                                raise FileNotFoundError(f'Required video not found: {intended_video_name}')
+                            else:
+                                print0(f'WARNING!!! This required video is not found! Missing benchmark videos can lead to unfair evaluation result. The missing video is: {intended_video_name}')
+                                missing_videos_count += 1
+                    # Only add to the list if we have at least some videos (or all if enable_missing_videos is False)
+                    if prompt_dict['video_list'] or not enable_missing_videos:
+                        cur_full_info_list.append(prompt_dict)
 
 
         cur_full_info_path = os.path.join(self.output_path, name+'_full_info.json')
         save_json(cur_full_info_list, cur_full_info_path)
         print0(f'Evaluation meta data saved to {cur_full_info_path}')
+
+        if missing_videos_count > 0:
+            print0(f'WARNING: {missing_videos_count} videos were missing and skipped')
+
         return cur_full_info_path
 
 
-    def evaluate(self, videos_path, name, prompt_list=[], dimension_list=None, local=False, read_frame=False, mode='vbench_standard', custom_image_folder=None, resolution="1-1", **kwargs):
+    def evaluate(self, videos_path, name, prompt_list=[], dimension_list=None, local=False, read_frame=False, mode='vbench_standard', custom_image_folder=None, resolution="1-1", enable_missing_videos=False, **kwargs):
         results_dict = {}
         if dimension_list is None:
             dimension_list = self.build_full_dimension_list()
@@ -195,7 +281,7 @@ class PBench(object):
             i2v_submodules = init_submodules_i2v([d for d in dimension_list if d in i2v_dims], local=local, read_frame=read_frame, resolution=resolution or "1-1")
             submodules_dict.update(i2v_submodules)
 
-        cur_full_info_path = self.build_full_info_json(videos_path, name, dimension_list, prompt_list, mode=mode, custom_image_folder=custom_image_folder, **kwargs)
+        cur_full_info_path = self.build_full_info_json(videos_path, name, dimension_list, prompt_list, mode=mode, custom_image_folder=custom_image_folder, enable_missing_videos=enable_missing_videos, **kwargs)
         summary_results = {}
         for dimension in dimension_list:
             try:

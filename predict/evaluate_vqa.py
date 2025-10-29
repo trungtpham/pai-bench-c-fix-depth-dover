@@ -28,6 +28,8 @@ def main():
                        help="Directory to save results")
     parser.add_argument("--subset", type=str, default=None,
                        help="Evaluate only a subset (e.g., 'human', 'av', 'common_sense')")
+    parser.add_argument("--enable_missing_videos", action="store_true",
+                       help="If True, skip missing videos during evaluation; otherwise, error out if videos are missing")
 
     args = parser.parse_args()
 
@@ -63,7 +65,8 @@ def main():
             prompt_file=args.prompt_file,
             model_name=args.model_name,
             device=args.device,
-            tensor_parallel_size=args.tensor_parallel_size
+            tensor_parallel_size=args.tensor_parallel_size,
+            enable_missing_videos=args.enable_missing_videos
         )
 
         # Save results

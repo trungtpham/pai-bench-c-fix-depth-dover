@@ -114,6 +114,11 @@ def parse_args():
         default=None,
         help="the path for customized images",
     )
+    parser.add_argument(
+        "--enable_missing_videos",
+        action="store_true",
+        help="If True, skip missing videos during evaluation; otherwise, error out if videos are missing",
+    )
     args = parser.parse_args()
     return args
 
@@ -154,10 +159,14 @@ def main():
             matching_videos = glob.glob(pattern)
             for video_path in matching_videos:
                 video_path_to_prompt[video_path] = prompt_dict
+            video_path = os.path.join(args.videos_path, f'{video_id}.mp4')
+            if os.path.exists(video_path):
+                video_path_to_prompt[video_path] = prompt_dict
 
         prompt = video_path_to_prompt
 
         assert isinstance(video_path_to_prompt, dict), "Invalid prompt file format. The correct format is {\"video_path\": prompt, ... }"
+        assert len(video_path_to_prompt) > 0, "No videos found for the given video_id"
     elif args.prompt != "None":
         prompt = [args.prompt]
 
@@ -176,6 +185,7 @@ def main():
         mode=args.mode,
         custom_image_folder=args.custom_image_folder,
         resolution=args.ratio,
+        enable_missing_videos=args.enable_missing_videos,
         **kwargs
     )
     print0('done')
