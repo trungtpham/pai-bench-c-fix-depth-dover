@@ -10,6 +10,7 @@
 [![Hugging Face - Reason](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Reason-orange)](https://huggingface.co/datasets/shi-labs/physical-ai-bench-reason)
 ![Paper Coming Soon](https://img.shields.io/badge/Paper-Coming%20Soon-yellow)
 ![Georgia Tech](https://img.shields.io/badge/Affiliation-Georgia%20Tech-ad9e66)
+![CMU](https://img.shields.io/badge/Affiliation-CMU-c41230)
 
 ## Introduction
 
@@ -45,7 +46,7 @@ If you use Physical AI Bench in your research, please cite:
 ```bibtex
 @misc{PAIBench2025,
   title={Physical AI Bench: A Comprehensive Benchmark for Physical AI Generation and Understanding},
-  author={Fengzhe Zhou and Jiannan Huang and Jialuo Li and Humphrey Shi},
+  author={Fengzhe Zhou and Jiannan Huang and Jialuo Li and Deva Ramanan and Humphrey Shi},
   year={2025},
   url={https://github.com/SHI-Labs/physical-ai-bench}
 }
@@ -53,4 +54,4 @@ If you use Physical AI Bench in your research, please cite:
 
 ## Acknowledgements
 
-We would like to thank NVIDIA Research, especially the Cosmos team for their support which led to the creation of PAI-Bench. We also thank Yin Cui, Jinwei Gu, Heng Wang, Prithvijit Chattopadhyay, Andrew Z. Wang, Imad El Hanafi, and Ming-Yu Liu for their valuable feedback and collaboration that helped shaped the project. This research was supported in part by National Science Foundation under Award #2427478 - CAREER Program, and by National Science Foundation and the Institute of Education Sciences, U.S. Department of Education under Award #2229873 - National AI Institute for Exceptional Education. This project was also partially supported by cyberinfrastructure resources and services provided Georgia Institute of Technology.
+We would like to thank NVIDIA Research, especially the Cosmos team for their support which led to the creation of PAI-Bench. We also thank [Yin Cui](https://ycui.me/), [Jinwei Gu](https://www.gujinwei.org/), [Heng Wang](https://hengcv.github.io/), [Prithvijit Chattopadhyay](https://prithv1.xyz/), Andrew Z. Wang, [Imad El Hanafi](https://imadelh.gitlab.io/), and [Ming-Yu Liu](https://mingyuliu.net/) for their valuable feedback and collaboration that helped shaped the project. This research was supported in part by National Science Foundation under Award #2427478 - CAREER Program, and by National Science Foundation and the Institute of Education Sciences, U.S. Department of Education under Award #2229873 - National AI Institute for Exceptional Education. This project was also partially supported by cyberinfrastructure resources and services provided Georgia Institute of Technology.
