@@ -93,7 +93,7 @@ class QwenVLEvaluator:
             "max_model_len": 65536,
             "limit_mm_per_prompt": {"video": 1},
             "tensor_parallel_size": self.tensor_parallel_size,
-            "gpu_memory_utilization": 0.75,
+            "gpu_memory_utilization": 0.55,
             "enable_expert_parallel": True,
         }
 

@@ -181,8 +181,8 @@ predict/models/
 uv.lock
 
 
-#Transfer Specific Ignore
 transfer/checkpoint/
-backup/
 reason/dataset/
 reason/output/
+
+backup/
