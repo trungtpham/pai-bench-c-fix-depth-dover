@@ -18,7 +18,7 @@ from loguru import logger
 from tqdm import tqdm
 
 from benchmark_pipelines.scores.transfer_bench.utils import (
-    numpy_array_to_video_bytes, read_video, safe_resize, should_compute,
+    read_video, safe_resize, should_compute,
     write_video)
 from models import dover, grounded_sam_v2, video_depth_anything
 from schemas import eff_segmentation
@@ -167,8 +167,12 @@ class Task:
     pred_segmentation_pkl_file: str = ""
     pred_segmentation_mp4_file: str = ""
     pred_depth_mp4_file: str = ""
+    pred_depth_npy_file: str = ""
     pred_blur_mp4_file: str = ""
     pred_canny_mp4_file: str = ""
+
+    force_recompute_pred_seg: bool = False
+    force_recompute_pred_depth: bool = False
 
     max_frames: int | None = 121
     caption: str | None = None
@@ -289,13 +293,16 @@ def resize_videos(tasks: list[Task], num_workers: int = 4) -> list[Task]:
 
 
 def dover_single_task(task: Task, dover_model) -> Task:
-    """Process single task with DOVER model"""
-    assert task.pred_resized_video_array is not None
-    assert task.gt_video_array is not None
-    assert task.fps
+    """Process single task with DOVER model.
 
-    video_buffer_pred = numpy_array_to_video_bytes(task.pred_resized_video_array, fps=task.fps)
-    video_buffer_gt = numpy_array_to_video_bytes(task.gt_video_array, fps=task.fps)
+    Read video bytes directly from the original files to avoid quality loss from
+    re-encoding the numpy array (imageio uses lossy H.264 by default, which
+    artificially lowers DOVER scores vs. the original high-quality source).
+    """
+    with open(task.pred_video_file, "rb") as f:
+        video_buffer_pred = f.read()
+    with open(task.gt_video_file, "rb") as f:
+        video_buffer_gt = f.read()
 
     results = dover_model([video_buffer_pred])
     task.dover_tech_score = float(results[0])
@@ -419,10 +426,13 @@ def blur_single_task(task: Task) -> Task:
     return task
 
 
-def compute_and_save_segments(caption: str, frames: np.ndarray, fps: int, pkl_fn: Optional[str], sam_model) -> list:
-    """Compute and save segmentation using SAM model"""
-    buffer = numpy_array_to_video_bytes(frames, fps=fps)
-    seg_list = sam_model.generate_single(buffer, caption)
+def compute_and_save_segments(caption: str, video_path: str, pkl_fn: Optional[str], sam_model) -> list:
+    """Compute and save segmentation using SAM model.
+
+    Passes the video file path directly to the SAM model, avoiding the
+    bytes→/tmp→read roundtrip that caused ffmpeg failures under concurrent load.
+    """
+    seg_list = sam_model.generate_single(video_path, caption)
     # save the SAM2-inferred segmentation as pkl
     if pkl_fn:
         with open(pkl_fn, "wb") as fp:
@@ -438,8 +448,7 @@ def sam_single_task(task: Task, sam_model) -> Task:
 
     task.pred_seg_dicts = compute_and_save_segments(
         task.caption,
-        task.pred_resized_video_array,
-        task.pred_fps,
+        task.pred_video_file,
         task.pred_segmentation_pkl_file,
         sam_model,
     )
@@ -447,8 +456,7 @@ def sam_single_task(task: Task, sam_model) -> Task:
     if should_compute(task.gt_segmentation_pkl_file, task.force_recompute_gt_seg):
         task.gt_seg_dicts = compute_and_save_segments(
             task.caption,
-            task.gt_video_array,
-            task.fps,
+            task.gt_video_file,
             task.gt_segmentation_pkl_file,
             sam_model,
         )
@@ -502,14 +510,20 @@ def segmentation_mp4_single_task(task: Task) -> Task:
         # logger.warning("Skipping saving of pred segments as MP4: no path specified")
         return task
 
-    assert task.pred_seg_dicts
+    if not task.pred_seg_dicts:
+        logger.warning(f"Skipping MP4 visualization: no predicted segments for {task.pred_video_file}")
+        return task
+    # Derive T/H/W from the actual mask shape — pred masks may be at a different
+    # resolution than task.video_shape (GT res) when the original pred video bytes
+    # are passed to SAM directly (no lossy resize-then-re-encode).
+    seg_t, seg_h, seg_w = task.pred_seg_dicts[0].segmentation_mask_rle.mask_shape
     tmp_file = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.mp4")
     try:
         sam_pkl_dict_to_mp4(
             task.pred_seg_dicts,
-            T=task.video_shape[0],
-            H=task.video_shape[1],
-            W=task.video_shape[2],
+            T=seg_t,
+            H=seg_h,
+            W=seg_w,
             fps=task.pred_fps,
             mp4_pth=tmp_file,
             max_frames=task.max_frames,
@@ -553,9 +567,16 @@ def depth_single_task(task: Task, depth_model) -> Task:
         compute_depth_error_video_sirmse
 
     try:
-        assert (task.pred_resized_video_array is not None) and (task.gt_video_array is not None)
+        assert task.gt_video_array is not None
 
-        pred_depth = depth_model.generate(task.pred_resized_video_array)
+        # Run depth on the original-resolution pred video, matching imaginaire4's
+        # run_metric.py which calls `self._depth.generate(pred_frames)` on the
+        # decoded pred video at its native resolution (e.g. 720p), then resizes
+        # the resulting depth map to GT resolution.  Using the pre-resized
+        # pred_resized_video_array (GT res ≈ 480p) discards detail before depth
+        # estimation and slightly degrades the depth quality.
+        pred_frames_orig, _ = read_video(task.pred_video_file, task.max_frames)
+        pred_depth = depth_model.generate(pred_frames_orig)
         pred_depth = pred_depth.astype(np.float64)  # absolute depth values in meters
 
         if should_compute(task.gt_depth_npy_file, task.force_recompute_gt_depth):
@@ -676,9 +697,9 @@ def process_tasks_with_model(tasks: list[Task]) -> list[Task]:
         torch.distributed.barrier()
     print0("All ranks completed Canny edge detection")
 
-    print0(f"Rank {rank}: Processing blur analysis with 8 processes...")
-    from concurrent.futures import ProcessPoolExecutor
-    with ProcessPoolExecutor(max_workers=8) as executor:
+    print0(f"Rank {rank}: Processing blur analysis with 4 threads...")
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = [executor.submit(blur_single_task, task) for task in tasks]
         for i, future in enumerate(tqdm(futures, desc="Blur analysis", disable=(rank != 0))):
             tasks[i] = future.result()
@@ -810,6 +831,7 @@ def prepare_tasks_from_filesystem(
         task.pred_canny_mp4_file = (pred_video_file.parent.parent / "canny" / pred_video_file.name).as_posix()
         task.pred_blur_mp4_file = (pred_video_file.parent.parent / "blur" / pred_video_file.name).as_posix()
         task.pred_depth_mp4_file = (pred_video_file.parent.parent / "depth" / pred_video_file.name).as_posix()
+        task.pred_depth_npy_file = (pred_video_file.parent.parent / "depth_npzs" / pred_video_file.name.replace(".mp4", ".npz")).as_posix()
 
         assert Path(task.gt_video_file).exists(), f"GT video {task.gt_video_file} not found"
         assert Path(task.video_caption_file).exists(), f"GT caption {task.video_caption_file} not found"
@@ -821,8 +843,11 @@ def prepare_tasks_from_filesystem(
             task.pred_depth_mp4_file,
             task.pred_segmentation_pkl_file,
             task.pred_resized_video_file,
+            task.pred_depth_npy_file,
+            task.gt_segmentation_pkl_file,
+            task.gt_depth_npy_file,
         ]:
-            if not Path(file).parent.exists():
+            if file and not Path(file).parent.exists():
                 Path(file).parent.mkdir(parents=True, exist_ok=True)
         tasks.append(task)
 

@@ -59,7 +59,11 @@ def convert_rgb_mp4_to_canny_mp4(
 
     t_lower, t_upper = get_canny_t(preset_strength)
 
-    edge_maps = [cv2.Canny(img, t_lower, t_upper) for img in vid_frames]
+    # Convert RGB→GRAY explicitly to match imaginaire4 (run_metric.py uses
+    # cv2.cvtColor(f, cv2.COLOR_RGB2GRAY) before Canny).  Without this,
+    # cv2.Canny receives an RGB frame and internally treats it as BGR,
+    # swapping the R/B channel weights in the grayscale conversion.
+    edge_maps = [cv2.Canny(cv2.cvtColor(img, cv2.COLOR_RGB2GRAY), t_lower, t_upper) for img in vid_frames]
     edge_maps = np.stack(edge_maps)
 
     if should_save_or_overwrite(out_fn_canny_mp4, force_overwrite):

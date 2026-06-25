@@ -23,22 +23,9 @@
 import glob
 import os
 import subprocess
-
-import subprocess
 import sys
 
-def install_torch():
-    try:
-        import torch
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "torch"])
-
-# Call the function to ensure torch is installed
-install_torch()
-
-import torch
 from setuptools import find_packages, setup
-from torch.utils.cpp_extension import CUDA_HOME, CppExtension, CUDAExtension
 
 # groundingdino version info
 version = "0.1.0"
@@ -62,10 +49,13 @@ def write_version_file():
 
 requirements = ["torch", "torchvision"]
 
-torch_ver = [int(x) for x in torch.__version__.split(".")[:2]]
-
 
 def get_extensions():
+    # torch is imported here (not at module level) so that setup.py metadata
+    # steps (prepare_metadata_for_build_editable) work without torch installed.
+    import torch
+    from torch.utils.cpp_extension import CUDA_HOME, CppExtension, CUDAExtension
+
     this_dir = os.path.dirname(os.path.abspath(__file__))
     extensions_dir = os.path.join(this_dir, "groundingdino", "models", "GroundingDINO", "csrc")
 
@@ -87,15 +77,13 @@ def get_extensions():
         extension = CUDAExtension
         sources += source_cuda
         define_macros += [("WITH_CUDA", None)]
+        # Hardcoded gencode flags removed — TORCH_CUDA_ARCH_LIST controls arch
+        # selection. Old archs (sm_70/75/80/86) are not supported by CUDA 13+.
         extra_compile_args["nvcc"] = [
             "-DCUDA_HAS_FP16=1",
             "-D__CUDA_NO_HALF_OPERATORS__",
             "-D__CUDA_NO_HALF_CONVERSIONS__",
             "-D__CUDA_NO_HALF2_OPERATORS__",
-            "-gencode=arch=compute_70,code=sm_70",
-            "-gencode=arch=compute_75,code=sm_75",
-            "-gencode=arch=compute_80,code=sm_80",
-            "-gencode=arch=compute_86,code=sm_86",
         ]
     else:
         print("Compiling without CUDA")
@@ -205,6 +193,12 @@ if __name__ == "__main__":
 
     write_version_file()
 
+    ext_modules = get_extensions()
+    cmdclass = {}
+    if ext_modules:
+        import torch.utils.cpp_extension
+        cmdclass = {"build_ext": torch.utils.cpp_extension.BuildExtension}
+
     setup(
         name="groundingdino",
         version="0.1.0",
@@ -219,6 +213,6 @@ if __name__ == "__main__":
                 "tests",
             )
         ),
-        ext_modules=get_extensions(),
-        cmdclass={"build_ext": torch.utils.cpp_extension.BuildExtension},
+        ext_modules=ext_modules,
+        cmdclass=cmdclass,
     )

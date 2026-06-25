@@ -12,7 +12,6 @@ dependencies = [
     "torch",
     "torchvision",
     "loguru",
-    "decord",
     "matplotlib",
     "scipy",
     "numpy",
@@ -20,7 +19,8 @@ dependencies = [
     "timm",
     "einops",
     "scikit-video",
-    "transformers",
+    "transformers==4.46.3",  # must match imaginaire4 — GroundingDINO post-processing differs across major versions
+    "sam2==1.1.0",  # must match imaginaire4 — sam2_video_predictor propagation logic differs across versions
     "hydra-core",
     "attrs",
     "pandas",
@@ -37,7 +37,7 @@ dependencies = [
     "imageio-ffmpeg",
     "lpips",
     "easydict",
-    "xformers",
+    # "xformers",  # removed: 0.0.35 has no CUDA kernels for GB200 (sm_100); fallback to PyTorch native attention
     "scikit-image",
     "typer",
 ]
@@ -49,7 +49,6 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 include-package-data = true
 
-# Configure package discovery to include all packages
 [tool.setuptools.packages.find]
 include = ["*"]
 exclude = ["tests*"]
