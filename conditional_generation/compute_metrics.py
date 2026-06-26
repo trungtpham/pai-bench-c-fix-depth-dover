@@ -638,7 +638,11 @@ def process_tasks_with_model(tasks: list[Task]) -> list[Task]:
     sam_model.setup()
 
     for i, task in enumerate(tqdm(tasks, desc="SAM segmentation", disable=(rank != 0))):
-        tasks[i] = sam_single_task(task, sam_model)
+        try:
+            tasks[i] = sam_single_task(task, sam_model)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"SAM segmentation failed for task {task.pred_video_file}: {e}", exc_info=True)
+            # Leave task as-is (pred_seg_dicts=None); downstream metrics will produce 0/NaN for this task.
 
     # Unload SAM model
     del sam_model
