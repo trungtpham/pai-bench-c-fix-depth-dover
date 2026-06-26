@@ -1,3 +1,4 @@
+import datetime
 import gc
 import json
 import os
@@ -84,7 +85,7 @@ def gather_list_of_dict(data):
     os.makedirs(temp_dir, exist_ok=True)
 
     # Barrier to ensure directory is created
-    torch.distributed.barrier()
+    torch.distributed.barrier(timeout=datetime.timedelta(hours=2))
 
     # Each rank saves its data to a file
     rank_file = os.path.join(temp_dir, f"rank_{rank}.pkl")
@@ -94,7 +95,7 @@ def gather_list_of_dict(data):
     # Synchronize all ranks and ensure data is written
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    torch.distributed.barrier()
+    torch.distributed.barrier(timeout=datetime.timedelta(hours=2))
 
     # All ranks can now read all files
     gathered_data = []
@@ -105,7 +106,7 @@ def gather_list_of_dict(data):
             gathered_data.extend(rank_data)
 
     # Clean up - only rank 0 removes the directory
-    torch.distributed.barrier()
+    torch.distributed.barrier(timeout=datetime.timedelta(hours=2))
     if rank == 0:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -630,7 +631,7 @@ def process_tasks_with_model(tasks: list[Task]) -> list[Task]:
     tasks = resize_videos(tasks, num_workers=4)
 
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        torch.distributed.barrier(timeout=datetime.timedelta(hours=2))
     print0("All ranks completed video and caption loading")
 
     # Step 2: SAM Model Processing (load once, process all tasks)
@@ -658,15 +659,23 @@ def process_tasks_with_model(tasks: list[Task]) -> list[Task]:
     torch.cuda.empty_cache()
 
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        # Use a generous timeout: 600-task runs have ~150 tasks/rank with some
+        # videos taking 3x longer than average; the default 600 s is too tight.
+        torch.distributed.barrier(timeout=datetime.timedelta(hours=2))
     print0("All ranks completed SAM segmentation")
 
     print0(f"Rank {rank}: Generating segmentation MP4s...")
     for i, task in enumerate(tqdm(tasks, desc="Segmentation MP4 generation", disable=(rank != 0))):
-        tasks[i] = segmentation_mp4_single_task(task)
+        try:
+            tasks[i] = segmentation_mp4_single_task(task)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Segmentation MP4 failed for task {task.pred_video_file}: {e}", exc_info=True)
+        finally:
+            gc.collect()
+            torch.cuda.empty_cache()
 
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        torch.distributed.barrier(timeout=datetime.timedelta(hours=2))
     print0("All ranks completed segmentation MP4 generation")
 
     # Step 3: DOVER Model Processing (load once, process all tasks)
@@ -682,7 +691,7 @@ def process_tasks_with_model(tasks: list[Task]) -> list[Task]:
     torch.cuda.empty_cache()
 
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        torch.distributed.barrier(timeout=datetime.timedelta(hours=2))
     print0("All ranks completed DOVER scoring")
 
     # Step 4: Depth Model Processing (load once, process all tasks)
@@ -698,7 +707,7 @@ def process_tasks_with_model(tasks: list[Task]) -> list[Task]:
     torch.cuda.empty_cache()
 
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        torch.distributed.barrier(timeout=datetime.timedelta(hours=2))
     print0("All ranks completed depth estimation")
 
     # Step 5: Non-model processing (no GPU models needed)
@@ -707,7 +716,7 @@ def process_tasks_with_model(tasks: list[Task]) -> list[Task]:
         tasks[i] = canny_single_task(task)
 
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        torch.distributed.barrier(timeout=datetime.timedelta(hours=2))
     print0("All ranks completed Canny edge detection")
 
     print0(f"Rank {rank}: Processing blur analysis with 4 threads...")
@@ -718,7 +727,7 @@ def process_tasks_with_model(tasks: list[Task]) -> list[Task]:
             tasks[i] = future.result()
 
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        torch.distributed.barrier(timeout=datetime.timedelta(hours=2))
     print0("All ranks completed blur analysis")
 
     print0(f"Rank {rank}: Computing mask IoU...")
@@ -726,14 +735,14 @@ def process_tasks_with_model(tasks: list[Task]) -> list[Task]:
         tasks[i] = mask_iou_single_task(task)
 
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        torch.distributed.barrier(timeout=datetime.timedelta(hours=2))
     print0("All ranks completed mask IoU computation")
 
     print0(f"Rank {rank}: Unloading data...")
     tasks = unload_task_data(tasks)
 
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        torch.distributed.barrier(timeout=datetime.timedelta(hours=2))
     print0("All ranks completed data unloading")
 
     return tasks
