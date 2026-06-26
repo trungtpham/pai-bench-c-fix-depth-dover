@@ -640,6 +640,7 @@ def process_tasks_with_model(tasks: list[Task]) -> list[Task]:
     sam_model.setup()
 
     for i, task in enumerate(tqdm(tasks, desc="SAM segmentation", disable=(rank != 0))):
+        logger.debug(f"[rank {rank}] SAM segmentation task {i}/{len(tasks)}: {task.pred_video_file}")
         try:
             tasks[i] = sam_single_task(task, sam_model)
         except Exception as e:  # noqa: BLE001
