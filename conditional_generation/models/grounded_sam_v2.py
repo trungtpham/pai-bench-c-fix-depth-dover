@@ -1,5 +1,6 @@
 """Grounded SAM model."""
 
+import logging
 import pathlib
 import sys
 from collections import OrderedDict
@@ -9,6 +10,8 @@ import imageio
 import numpy as np
 import torch
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 from schemas import eff_segmentation
 from utils import model_utils, tmp_files
@@ -48,6 +51,11 @@ _TEXT_THRESHOLD = 0.25
 IMAGE_MEAN = np.array([0.485, 0.456, 0.406])
 IMAGE_STD = np.array([0.229, 0.224, 0.225])
 NUM_POINTS_SAMPLED = 10
+# Hard cap on tracked objects per video. GroundingDINO over-detects on rich
+# PAI-Bench-C prompts (up to 42 objects observed), causing SAM2 to propagate
+# too many tracks through 121 frames and trigger CUDA OOM (SIGABRT). The cap
+# keeps the top-N highest-confidence detections (DINO output is confidence-sorted).
+MAX_SAM_OBJECTS_PER_VIDEO = 20
 
 
 def sample_points_from_masks(masks, num_points):
@@ -464,6 +472,15 @@ class GroundedSAMV2(model_utils.ModelInterface):
         objects = new_objects
         if len(objects) == 0:
             return []
+
+        if len(objects) > MAX_SAM_OBJECTS_PER_VIDEO:
+            logger.warning(
+                f"Capping SAM tracks from {len(objects)} to {MAX_SAM_OBJECTS_PER_VIDEO} "
+                f"(DINO over-detected on rich caption)"
+            )
+            objects = objects[:MAX_SAM_OBJECTS_PER_VIDEO]
+            new_image_masks = new_image_masks[:MAX_SAM_OBJECTS_PER_VIDEO]
+
         image_masks = np.array(new_image_masks)
 
         video_segments = self._sam_v2_predict_video(
