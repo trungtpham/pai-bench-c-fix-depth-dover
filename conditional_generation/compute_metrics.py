@@ -1,3 +1,4 @@
+import gc
 import json
 import os
 import pickle
@@ -643,9 +644,17 @@ def process_tasks_with_model(tasks: list[Task]) -> list[Task]:
         except Exception as e:  # noqa: BLE001
             logger.error(f"SAM segmentation failed for task {task.pred_video_file}: {e}", exc_info=True)
             # Leave task as-is (pred_seg_dicts=None); downstream metrics will produce 0/NaN for this task.
+        finally:
+            # Explicitly release GPU memory after every task to prevent CUDA OOM
+            # from accumulating across ~150 sequential tasks per rank on 600-task runs.
+            # Without this, SAM2's inference_state tensors linger and eventually
+            # cause a SIGABRT from libtorch_cuda (not catchable by Python try/except).
+            gc.collect()
+            torch.cuda.empty_cache()
 
     # Unload SAM model
     del sam_model
+    gc.collect()
     torch.cuda.empty_cache()
 
     if torch.distributed.is_initialized():
