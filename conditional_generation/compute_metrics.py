@@ -1,3 +1,4 @@
+import gc
 import json
 import os
 import pickle
@@ -18,7 +19,7 @@ from loguru import logger
 from tqdm import tqdm
 
 from benchmark_pipelines.scores.transfer_bench.utils import (
-    numpy_array_to_video_bytes, read_video, safe_resize, should_compute,
+    read_video, safe_resize, should_compute,
     write_video)
 from models import dover, grounded_sam_v2, video_depth_anything
 from schemas import eff_segmentation
@@ -167,8 +168,12 @@ class Task:
     pred_segmentation_pkl_file: str = ""
     pred_segmentation_mp4_file: str = ""
     pred_depth_mp4_file: str = ""
+    pred_depth_npy_file: str = ""
     pred_blur_mp4_file: str = ""
     pred_canny_mp4_file: str = ""
+
+    force_recompute_pred_seg: bool = False
+    force_recompute_pred_depth: bool = False
 
     max_frames: int | None = 121
     caption: str | None = None
@@ -289,13 +294,16 @@ def resize_videos(tasks: list[Task], num_workers: int = 4) -> list[Task]:
 
 
 def dover_single_task(task: Task, dover_model) -> Task:
-    """Process single task with DOVER model"""
-    assert task.pred_resized_video_array is not None
-    assert task.gt_video_array is not None
-    assert task.fps
+    """Process single task with DOVER model.
 
-    video_buffer_pred = numpy_array_to_video_bytes(task.pred_resized_video_array, fps=task.fps)
-    video_buffer_gt = numpy_array_to_video_bytes(task.gt_video_array, fps=task.fps)
+    Read video bytes directly from the original files to avoid quality loss from
+    re-encoding the numpy array (imageio uses lossy H.264 by default, which
+    artificially lowers DOVER scores vs. the original high-quality source).
+    """
+    with open(task.pred_video_file, "rb") as f:
+        video_buffer_pred = f.read()
+    with open(task.gt_video_file, "rb") as f:
+        video_buffer_gt = f.read()
 
     results = dover_model([video_buffer_pred])
     task.dover_tech_score = float(results[0])
@@ -419,10 +427,13 @@ def blur_single_task(task: Task) -> Task:
     return task
 
 
-def compute_and_save_segments(caption: str, frames: np.ndarray, fps: int, pkl_fn: Optional[str], sam_model) -> list:
-    """Compute and save segmentation using SAM model"""
-    buffer = numpy_array_to_video_bytes(frames, fps=fps)
-    seg_list = sam_model.generate_single(buffer, caption)
+def compute_and_save_segments(caption: str, video_path: str, pkl_fn: Optional[str], sam_model) -> list:
+    """Compute and save segmentation using SAM model.
+
+    Passes the video file path directly to the SAM model, avoiding the
+    bytes→/tmp→read roundtrip that caused ffmpeg failures under concurrent load.
+    """
+    seg_list = sam_model.generate_single(video_path, caption)
     # save the SAM2-inferred segmentation as pkl
     if pkl_fn:
         with open(pkl_fn, "wb") as fp:
@@ -438,8 +449,7 @@ def sam_single_task(task: Task, sam_model) -> Task:
 
     task.pred_seg_dicts = compute_and_save_segments(
         task.caption,
-        task.pred_resized_video_array,
-        task.pred_fps,
+        task.pred_video_file,
         task.pred_segmentation_pkl_file,
         sam_model,
     )
@@ -447,8 +457,7 @@ def sam_single_task(task: Task, sam_model) -> Task:
     if should_compute(task.gt_segmentation_pkl_file, task.force_recompute_gt_seg):
         task.gt_seg_dicts = compute_and_save_segments(
             task.caption,
-            task.gt_video_array,
-            task.fps,
+            task.gt_video_file,
             task.gt_segmentation_pkl_file,
             sam_model,
         )
@@ -502,14 +511,20 @@ def segmentation_mp4_single_task(task: Task) -> Task:
         # logger.warning("Skipping saving of pred segments as MP4: no path specified")
         return task
 
-    assert task.pred_seg_dicts
+    if not task.pred_seg_dicts:
+        logger.warning(f"Skipping MP4 visualization: no predicted segments for {task.pred_video_file}")
+        return task
+    # Derive T/H/W from the actual mask shape — pred masks may be at a different
+    # resolution than task.video_shape (GT res) when the original pred video bytes
+    # are passed to SAM directly (no lossy resize-then-re-encode).
+    seg_t, seg_h, seg_w = task.pred_seg_dicts[0].segmentation_mask_rle.mask_shape
     tmp_file = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.mp4")
     try:
         sam_pkl_dict_to_mp4(
             task.pred_seg_dicts,
-            T=task.video_shape[0],
-            H=task.video_shape[1],
-            W=task.video_shape[2],
+            T=seg_t,
+            H=seg_h,
+            W=seg_w,
             fps=task.pred_fps,
             mp4_pth=tmp_file,
             max_frames=task.max_frames,
@@ -553,9 +568,16 @@ def depth_single_task(task: Task, depth_model) -> Task:
         compute_depth_error_video_sirmse
 
     try:
-        assert (task.pred_resized_video_array is not None) and (task.gt_video_array is not None)
+        assert task.gt_video_array is not None
 
-        pred_depth = depth_model.generate(task.pred_resized_video_array)
+        # Run depth on the original-resolution pred video, matching imaginaire4's
+        # run_metric.py which calls `self._depth.generate(pred_frames)` on the
+        # decoded pred video at its native resolution (e.g. 720p), then resizes
+        # the resulting depth map to GT resolution.  Using the pre-resized
+        # pred_resized_video_array (GT res ≈ 480p) discards detail before depth
+        # estimation and slightly degrades the depth quality.
+        pred_frames_orig, _ = read_video(task.pred_video_file, task.max_frames)
+        pred_depth = depth_model.generate(pred_frames_orig)
         pred_depth = pred_depth.astype(np.float64)  # absolute depth values in meters
 
         if should_compute(task.gt_depth_npy_file, task.force_recompute_gt_depth):
@@ -584,8 +606,96 @@ def depth_single_task(task: Task, depth_model) -> Task:
     return task
 
 
+def _eval_barrier() -> None:
+    """Distributed barrier used between pipeline stages within a batch."""
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+
+def _process_task_batch(batch: list[Task], rank: int, label: str) -> list[Task]:
+    """Run the full metric pipeline on a single batch of this rank's tasks.
+
+    Each task holds ~1 GB of decoded video frames (gt + pred + resized), so
+    loading all ~150 tasks/rank upfront needs ~150 GB of CPU RAM and triggers
+    OOM/swap on large runs. Processing one batch at a time bounds the resident set
+    to BATCH_SIZE tasks. GPU models are loaded once per batch (one at a time, as
+    before) and unloaded before the next, so peak GPU memory is unchanged.
+
+    Barriers are issued unconditionally (even for an empty trailing batch) so that
+    every rank performs the same number of collectives and stays in lockstep.
+    """
+    # Step 1: Load videos and captions (no models needed)
+    if batch:
+        print0(f"Rank {rank}: [{label}] loading {len(batch)} videos ...")
+        batch = load_videos(batch, num_workers=8)
+        batch = load_captions(batch)
+        batch = resize_videos(batch, num_workers=4)
+    _eval_barrier()
+
+    # Step 2: SAM segmentation
+    if batch:
+        sam_model = grounded_sam_v2.GroundedSAMV2()
+        sam_model.setup()
+        for i, task in enumerate(tqdm(batch, desc=f"SAM segmentation [{label}]", disable=(rank != 0))):
+            batch[i] = sam_single_task(task, sam_model)
+        del sam_model
+        torch.cuda.empty_cache()
+    _eval_barrier()
+
+    # Step 3: Segmentation MP4 visualization (uses the in-RAM seg dicts from SAM)
+    if batch:
+        for i, task in enumerate(batch):
+            batch[i] = segmentation_mp4_single_task(task)
+    _eval_barrier()
+
+    # Step 4: DOVER scoring
+    if batch:
+        dover_model = dover.DOVERVideoTechnicalScorer()
+        dover_model.setup()
+        for i, task in enumerate(batch):
+            batch[i] = dover_single_task(task, dover_model)
+        del dover_model
+        torch.cuda.empty_cache()
+    _eval_barrier()
+
+    # Step 5: Depth estimation
+    if batch:
+        depth_model = video_depth_anything.VideoDepthAnything()
+        depth_model.setup()
+        for i, task in enumerate(batch):
+            batch[i] = depth_single_task(task, depth_model)
+        del depth_model
+        torch.cuda.empty_cache()
+    _eval_barrier()
+
+    # Step 6: Canny + blur (no GPU model needed)
+    if batch:
+        for i, task in enumerate(batch):
+            batch[i] = canny_single_task(task)
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(blur_single_task, task) for task in batch]
+            for i, future in enumerate(futures):
+                batch[i] = future.result()
+    _eval_barrier()
+
+    # Step 7: Mask IoU, then free heavy per-task data (video arrays + seg dicts)
+    # before the batch is accumulated into the rank-level result list, so the final
+    # gather only carries metrics.
+    if batch:
+        for i, task in enumerate(batch):
+            batch[i] = mask_iou_single_task(task)
+        batch = unload_task_data(batch)
+    _eval_barrier()
+
+    return batch
+
+
 def process_tasks_with_model(tasks: list[Task]) -> list[Task]:
-    """Process tasks with outer model loop, inner data loop structure"""
+    """Process this rank's tasks in fixed-size batches.
+
+    Batching keeps peak CPU RAM proportional to BATCH_SIZE rather than the full
+    ~150 tasks/rank, which is what causes OOM/SIGABRT on large (600-task) runs.
+    """
     rank = get_rank()
     world_size = get_world_size()
     print0(f"Processing {len(tasks)} tasks across {world_size} ranks")
@@ -594,115 +704,30 @@ def process_tasks_with_model(tasks: list[Task]) -> list[Task]:
     tasks = distribute_list_to_rank(tasks)
     print0(f"Rank {rank} processing {len(tasks)} tasks")
 
-    if not tasks:
-        return []
+    batch_size = int(os.environ.get("PAIBENCH_C_EVAL_BATCH_SIZE", "30"))
+    batch_size = max(1, batch_size)
 
-    # Step 1: Load videos and captions (no models needed)
-    print0(f"Rank {rank}: Loading videos with multi-threading...")
-    tasks = load_videos(tasks, num_workers=8)
+    # Every rank must run the same number of batches so the per-stage barriers stay
+    # aligned; round-robin can leave ranks with a different task count. Take the
+    # global max so under-full ranks issue empty (barrier-only) batches.
+    local_num_batches = (len(tasks) + batch_size - 1) // batch_size
+    num_batches = local_num_batches
+    if torch.distributed.is_initialized() and world_size > 1:
+        nb = torch.tensor([local_num_batches], device="cuda" if torch.cuda.is_available() else "cpu")
+        torch.distributed.all_reduce(nb, op=torch.distributed.ReduceOp.MAX)
+        num_batches = int(nb.item())
 
-    print0(f"Rank {rank}: Processing captions...")
-    tasks = load_captions(tasks)
+    print0(f"Rank {rank}: processing in {num_batches} batch(es) of up to {batch_size} task(s)")
 
-    print0(f"Rank {rank}: Resizing videos with multi-threading...")
-    tasks = resize_videos(tasks, num_workers=4)
+    processed: list[Task] = []
+    for b in range(num_batches):
+        batch = tasks[b * batch_size:(b + 1) * batch_size]
+        label = f"batch {b + 1}/{num_batches}"
+        processed.extend(_process_task_batch(batch, rank, label))
+        gc.collect()
+        torch.cuda.empty_cache()
 
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-    print0("All ranks completed video and caption loading")
-
-    # Step 2: SAM Model Processing (load once, process all tasks)
-    print0(f"Rank {rank}: Processing SAM segmentation...")
-    sam_model = grounded_sam_v2.GroundedSAMV2()
-    sam_model.setup()
-
-    for i, task in enumerate(tqdm(tasks, desc="SAM segmentation", disable=(rank != 0))):
-        tasks[i] = sam_single_task(task, sam_model)
-
-    # Unload SAM model
-    del sam_model
-    torch.cuda.empty_cache()
-
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-    print0("All ranks completed SAM segmentation")
-
-    print0(f"Rank {rank}: Generating segmentation MP4s...")
-    for i, task in enumerate(tqdm(tasks, desc="Segmentation MP4 generation", disable=(rank != 0))):
-        tasks[i] = segmentation_mp4_single_task(task)
-
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-    print0("All ranks completed segmentation MP4 generation")
-
-    # Step 3: DOVER Model Processing (load once, process all tasks)
-    print0(f"Rank {rank}: Computing DOVER scores...")
-    dover_model = dover.DOVERVideoTechnicalScorer()
-    dover_model.setup()
-
-    for i, task in enumerate(tqdm(tasks, desc="DOVER scoring", disable=(rank != 0))):
-        tasks[i] = dover_single_task(task, dover_model)
-
-    # Unload DOVER model
-    del dover_model
-    torch.cuda.empty_cache()
-
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-    print0("All ranks completed DOVER scoring")
-
-    # Step 4: Depth Model Processing (load once, process all tasks)
-    print0(f"Rank {rank}: Computing depth maps...")
-    depth_model = video_depth_anything.VideoDepthAnything()
-    depth_model.setup()
-
-    for i, task in enumerate(tqdm(tasks, desc="Depth estimation", disable=(rank != 0))):
-        tasks[i] = depth_single_task(task, depth_model)
-
-    # Unload depth model
-    del depth_model
-    torch.cuda.empty_cache()
-
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-    print0("All ranks completed depth estimation")
-
-    # Step 5: Non-model processing (no GPU models needed)
-    print0(f"Rank {rank}: Processing Canny edge detection...")
-    for i, task in enumerate(tqdm(tasks, desc="Canny edge detection", disable=(rank != 0))):
-        tasks[i] = canny_single_task(task)
-
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-    print0("All ranks completed Canny edge detection")
-
-    print0(f"Rank {rank}: Processing blur analysis with 8 processes...")
-    from concurrent.futures import ProcessPoolExecutor
-    with ProcessPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(blur_single_task, task) for task in tasks]
-        for i, future in enumerate(tqdm(futures, desc="Blur analysis", disable=(rank != 0))):
-            tasks[i] = future.result()
-
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-    print0("All ranks completed blur analysis")
-
-    print0(f"Rank {rank}: Computing mask IoU...")
-    for i, task in enumerate(tqdm(tasks, desc="Mask IoU computation", disable=(rank != 0))):
-        tasks[i] = mask_iou_single_task(task)
-
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-    print0("All ranks completed mask IoU computation")
-
-    print0(f"Rank {rank}: Unloading data...")
-    tasks = unload_task_data(tasks)
-
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-    print0("All ranks completed data unloading")
-
-    return tasks
+    return processed
 
 
 def launch_pipeline(
@@ -810,6 +835,7 @@ def prepare_tasks_from_filesystem(
         task.pred_canny_mp4_file = (pred_video_file.parent.parent / "canny" / pred_video_file.name).as_posix()
         task.pred_blur_mp4_file = (pred_video_file.parent.parent / "blur" / pred_video_file.name).as_posix()
         task.pred_depth_mp4_file = (pred_video_file.parent.parent / "depth" / pred_video_file.name).as_posix()
+        task.pred_depth_npy_file = (pred_video_file.parent.parent / "depth_npzs" / pred_video_file.name.replace(".mp4", ".npz")).as_posix()
 
         assert Path(task.gt_video_file).exists(), f"GT video {task.gt_video_file} not found"
         assert Path(task.video_caption_file).exists(), f"GT caption {task.video_caption_file} not found"
@@ -821,8 +847,11 @@ def prepare_tasks_from_filesystem(
             task.pred_depth_mp4_file,
             task.pred_segmentation_pkl_file,
             task.pred_resized_video_file,
+            task.pred_depth_npy_file,
+            task.gt_segmentation_pkl_file,
+            task.gt_depth_npy_file,
         ]:
-            if not Path(file).parent.exists():
+            if file and not Path(file).parent.exists():
                 Path(file).parent.mkdir(parents=True, exist_ok=True)
         tasks.append(task)
 

@@ -66,6 +66,7 @@ def calculate_mask_iou_and_recall(
     res_masks: list[eff_segmentation.SAMV2Detection],
     matching: str = "max",
     threshold: float = 0.1,
+    foreground: np.ndarray | None = None,
     max_frames: int | None = None,
 ) -> tuple[float, float]:
     gt_phrase_index_dic = {}
@@ -123,9 +124,25 @@ def calculate_mask_iou_and_recall(
             union_res_mask[res_inst_masks == (id + 1)] = 255
         updated_res_masks.append(union_res_mask)
 
-    # print(f"Calculating iou on {len(updated_gt_masks)} gt masks and {len(updated_res_masks)} pred masks")
+    if foreground is None:
+        foreground = np.ones_like(gt_inst_masks, dtype=np.bool_)
 
-    foreground = np.ones_like(gt_inst_masks, dtype=np.bool_)
+    # Filter masks that are outside of foreground.  With an all-ones foreground
+    # (the default) this only removes completely empty masks (phrase not tracked
+    # in any frame), matching imaginaire4's behaviour.
+    def is_mostly_inside(bin_mask: np.ndarray) -> bool:
+        num_pixels_in_foreground = bin_mask[foreground].sum()
+        if num_pixels_in_foreground == 0:
+            return False
+        num_pixels_in_background = bin_mask[~foreground].sum()
+        if num_pixels_in_background == 0:
+            return True
+        return (num_pixels_in_foreground / num_pixels_in_background) >= 0.5
+
+    updated_gt_masks = [m for m in updated_gt_masks if is_mostly_inside(m)]
+    updated_res_masks = [m for m in updated_res_masks if is_mostly_inside(m)]
+
+    print(f"Calculating iou on {len(updated_gt_masks)} gt masks and {len(updated_res_masks)} pred masks")
 
     iou_matrix = get_iou_matrix(updated_gt_masks, updated_res_masks, foreground)
 
